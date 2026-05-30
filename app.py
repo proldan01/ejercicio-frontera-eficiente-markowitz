@@ -147,70 +147,112 @@ def retornos_calc(precios, frecuencia):
         return resampled.pct_change().dropna(), 12
     return precios.pct_change().dropna(), 252
 
+# ── MODULE-LEVEL SCIPY FUNCTIONS ─────────────────────────────────────────────
+# All functions passed to scipy.optimize.minimize MUST be defined at module
+# level (not as closures/inner functions). scipy 1.15+ / Python 3.14 wraps
+# objective and constraint functions through a pickling pipeline for the
+# gradient worker; closures that capture numpy arrays from an outer scope
+# are NOT picklable and raise TypeError. Module-level functions + the
+# args= parameter are the only reliable pattern.
+
+def _f_vol(w, cov):
+    """Portfolio volatility: sqrt(w' Σ w)."""
+    return float(np.sqrt(max(float(w @ cov @ w), 0.0)))
+
+def _f_neg_sharpe(w, mu, cov, rf):
+    """Negative Sharpe ratio (minimise to maximise Sharpe)."""
+    v = _f_vol(w, cov)
+    r = float(w @ mu)
+    return -(r - rf) / v if v > 1e-10 else 1e10
+
+def _f_neg_ret(w, mu):
+    """Negative portfolio return (minimise to maximise return)."""
+    return -float(w @ mu)
+
+def _c_sum1(w):
+    """Equality constraint: weights sum to 1."""
+    return float(np.sum(w)) - 1.0
+
+def _c_ret_eq(w, mu, target):
+    """Equality constraint: portfolio return equals target."""
+    return float(w @ mu) - float(target)
+
+def _c_vol_eq(w, cov, target):
+    """Equality constraint: portfolio volatility equals target."""
+    return _f_vol(w, cov) - float(target)
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 def port_stats(w, mu, cov, rf):
     r = float(np.dot(w, mu))
-    v = float(np.sqrt(np.dot(w, np.dot(cov, w))))
+    v = float(np.sqrt(max(float(np.dot(w, np.dot(cov, w))), 0.0)))
     return r, v, (r - rf) / v if v > 1e-10 else 0.0
 
+
 def optimizar(mu, cov, rf, objetivo, target, bmin, bmax):
-    # FIX 1: named inner functions + explicit float() to avoid TypeError in scipy 1.15+ / Python 3.14
-    _mu = np.asarray(mu, dtype=np.float64)
+    _mu  = np.asarray(mu,  dtype=np.float64)
     _cov = np.asarray(cov, dtype=np.float64)
-    n = len(_mu)
-    w0 = np.ones(n) / n
-    bd = [(float(bmin), float(bmax))] * n
+    n    = len(_mu)
+    w0   = np.ones(n) / n
+    bd   = [(float(bmin), float(bmax))] * n
     opts = {"maxiter": 3000, "ftol": 1e-12}
-
-    def _sum1(w):   return float(np.sum(w)) - 1.0
-    def _vol(w):    return float(np.sqrt(float(w @ _cov @ w)))
-    def _ret(w):    return float(w @ _mu)
-    def _neg_sr(w):
-        v = _vol(w)
-        return -(_ret(w) - rf) / v if v > 1e-10 else 1e10
-    def _neg_ret(w): return -_ret(w)
-
-    c1 = {"type": "eq", "fun": _sum1}
+    c1   = {"type": "eq", "fun": _c_sum1}   # module-level → picklable
 
     if objetivo == "Máximo Ratio Sharpe":
-        return minimize(_neg_sr, w0, "SLSQP", bounds=bd, constraints=[c1], options=opts)
+        return minimize(
+            _f_neg_sharpe, w0,
+            args=(_mu, _cov, float(rf)),
+            method="SLSQP", bounds=bd, constraints=[c1], options=opts,
+        )
     elif objetivo == "Mínima Volatilidad":
-        return minimize(_vol, w0, "SLSQP", bounds=bd, constraints=[c1], options=opts)
+        return minimize(
+            _f_vol, w0,
+            args=(_cov,),
+            method="SLSQP", bounds=bd, constraints=[c1], options=opts,
+        )
     elif objetivo == "Rendimiento Objetivo":
         _t = float(target or 0.0)
-        def _c_ret(w): return _ret(w) - _t
-        return minimize(_vol, w0, "SLSQP", bounds=bd,
-                        constraints=[c1, {"type": "eq", "fun": _c_ret}], options=opts)
+        c2 = {"type": "eq", "fun": _c_ret_eq, "args": (_mu, _t)}
+        return minimize(
+            _f_vol, w0,
+            args=(_cov,),
+            method="SLSQP", bounds=bd, constraints=[c1, c2], options=opts,
+        )
     elif objetivo == "Volatilidad Objetivo":
         _t = float(target or 0.0)
-        def _c_vol(w): return _vol(w) - _t
-        return minimize(_neg_ret, w0, "SLSQP", bounds=bd,
-                        constraints=[c1, {"type": "eq", "fun": _c_vol}], options=opts)
+        c2 = {"type": "eq", "fun": _c_vol_eq, "args": (_cov, _t)}
+        return minimize(
+            _f_neg_ret, w0,
+            args=(_mu,),
+            method="SLSQP", bounds=bd, constraints=[c1, c2], options=opts,
+        )
     else:
-        return minimize(_vol, w0, "SLSQP", bounds=bd, constraints=[c1], options=opts)
+        return minimize(
+            _f_vol, w0,
+            args=(_cov,),
+            method="SLSQP", bounds=bd, constraints=[c1], options=opts,
+        )
+
 
 def frontera_eficiente(mu, cov, rf, bmin, bmax, n_pts=80):
-    # FIX 2: same named-function pattern as optimizar to avoid lambda TypeError
-    _mu = np.asarray(mu, dtype=np.float64)
+    _mu  = np.asarray(mu,  dtype=np.float64)
     _cov = np.asarray(cov, dtype=np.float64)
-    n_a = len(_mu)
-    w0 = np.ones(n_a) / n_a
-    bd = [(float(bmin), float(bmax))] * n_a
+    n_a  = len(_mu)
+    w0   = np.ones(n_a) / n_a
+    bd   = [(float(bmin), float(bmax))] * n_a
+    c1   = {"type": "eq", "fun": _c_sum1}
 
-    def _sum1(w): return float(np.sum(w)) - 1.0
-    def _vol(w):  return float(np.sqrt(float(w @ _cov @ w)))
-    def _ret(w):  return float(w @ _mu)
-
-    c1 = {"type": "eq", "fun": _sum1}
-    r_mv = minimize(_vol, w0, "SLSQP", bounds=bd, constraints=[c1])
-    r_min = _ret(r_mv.x)
+    r_mv = minimize(_f_vol, w0, args=(_cov,), method="SLSQP",
+                    bounds=bd, constraints=[c1])
+    r_min = float(_mu @ r_mv.x)
     r_max = float(np.max(_mu))
 
     fe_r, fe_v, fe_s = [], [], []
     for r_t in np.linspace(r_min, r_max, n_pts):
-        _r = float(r_t)
-        def _c_ret(w, r=_r): return _ret(w) - r   # default-arg capture avoids late-binding
-        res = minimize(_vol, w0, "SLSQP", bounds=bd,
-                       constraints=[c1, {"type": "eq", "fun": _c_ret}],
+        # Pass r_t via args= so _c_ret_eq stays a module-level, picklable ref
+        c2 = {"type": "eq", "fun": _c_ret_eq, "args": (_mu, float(r_t))}
+        res = minimize(_f_vol, w0, args=(_cov,), method="SLSQP",
+                       bounds=bd, constraints=[c1, c2],
                        options={"maxiter": 500})
         if res.success or res.fun < 5.0:
             r, v, s = port_stats(res.x, _mu, _cov, rf)
