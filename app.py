@@ -123,18 +123,28 @@ def on_pick_change(i):
 # ── HELPER FUNCTIONS ──────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def descargar_precios(tickers_tuple, bm, inicio, fin):
+    # FIX 3: handle MultiIndex columns (yfinance ≥0.2.40) + strip timezone
     todos = list(tickers_tuple) + ([bm] if bm else [])
     data = yf.download(todos, start=inicio, end=fin, auto_adjust=True, progress=False)
-    if len(todos) == 1:
-        precios = data[["Close"]].rename(columns={"Close": todos[0]})
+    if isinstance(data.columns, pd.MultiIndex):
+        close = data["Close"].copy()
+    elif len(todos) == 1:
+        close = data[["Close"]].copy()
+        close.columns = [todos[0]]
     else:
-        precios = data["Close"]
-    return precios.dropna(how="all").ffill().dropna()
+        close = data["Close"].copy()
+    if hasattr(close.index, "tz") and close.index.tz is not None:
+        close.index = close.index.tz_localize(None)
+    return close.dropna(how="all").ffill().dropna()
 
 def retornos_calc(precios, frecuencia):
+    # FIX 4: "ME" alias requires pandas ≥2.2; fall back to "M" for older versions
     if frecuencia == "Mensual":
-        precios = precios.resample("ME").last()
-        return precios.pct_change().dropna(), 12
+        try:
+            resampled = precios.resample("ME").last()
+        except Exception:
+            resampled = precios.resample("M").last()
+        return resampled.pct_change().dropna(), 12
     return precios.pct_change().dropna(), 252
 
 def port_stats(w, mu, cov, rf):
@@ -143,40 +153,67 @@ def port_stats(w, mu, cov, rf):
     return r, v, (r - rf) / v if v > 1e-10 else 0.0
 
 def optimizar(mu, cov, rf, objetivo, target, bmin, bmax):
-    n = len(mu)
+    # FIX 1: named inner functions + explicit float() to avoid TypeError in scipy 1.15+ / Python 3.14
+    _mu = np.asarray(mu, dtype=np.float64)
+    _cov = np.asarray(cov, dtype=np.float64)
+    n = len(_mu)
     w0 = np.ones(n) / n
-    bd = [(bmin, bmax)] * n
-    c1 = {"type": "eq", "fun": lambda w: np.sum(w) - 1}
+    bd = [(float(bmin), float(bmax))] * n
     opts = {"maxiter": 3000, "ftol": 1e-12}
+
+    def _sum1(w):   return float(np.sum(w)) - 1.0
+    def _vol(w):    return float(np.sqrt(float(w @ _cov @ w)))
+    def _ret(w):    return float(w @ _mu)
+    def _neg_sr(w):
+        v = _vol(w)
+        return -(_ret(w) - rf) / v if v > 1e-10 else 1e10
+    def _neg_ret(w): return -_ret(w)
+
+    c1 = {"type": "eq", "fun": _sum1}
+
     if objetivo == "Máximo Ratio Sharpe":
-        f = lambda w: -((np.dot(w, mu) - rf) / max(np.sqrt(np.dot(w, np.dot(cov, w))), 1e-10))
+        return minimize(_neg_sr, w0, "SLSQP", bounds=bd, constraints=[c1], options=opts)
     elif objetivo == "Mínima Volatilidad":
-        f = lambda w: np.sqrt(np.dot(w, np.dot(cov, w)))
+        return minimize(_vol, w0, "SLSQP", bounds=bd, constraints=[c1], options=opts)
     elif objetivo == "Rendimiento Objetivo":
-        f = lambda w: np.sqrt(np.dot(w, np.dot(cov, w)))
-        c2 = {"type": "eq", "fun": lambda w: np.dot(w, mu) - target}
-        return minimize(f, w0, "SLSQP", bounds=bd, constraints=[c1, c2], options=opts)
+        _t = float(target or 0.0)
+        def _c_ret(w): return _ret(w) - _t
+        return minimize(_vol, w0, "SLSQP", bounds=bd,
+                        constraints=[c1, {"type": "eq", "fun": _c_ret}], options=opts)
     elif objetivo == "Volatilidad Objetivo":
-        f = lambda w: -np.dot(w, mu)
-        c2 = {"type": "eq", "fun": lambda w: np.sqrt(np.dot(w, np.dot(cov, w))) - target}
-        return minimize(f, w0, "SLSQP", bounds=bd, constraints=[c1, c2], options=opts)
-    return minimize(f, w0, "SLSQP", bounds=bd, constraints=[c1], options=opts)
+        _t = float(target or 0.0)
+        def _c_vol(w): return _vol(w) - _t
+        return minimize(_neg_ret, w0, "SLSQP", bounds=bd,
+                        constraints=[c1, {"type": "eq", "fun": _c_vol}], options=opts)
+    else:
+        return minimize(_vol, w0, "SLSQP", bounds=bd, constraints=[c1], options=opts)
 
 def frontera_eficiente(mu, cov, rf, bmin, bmax, n_pts=80):
-    n_a = len(mu)
+    # FIX 2: same named-function pattern as optimizar to avoid lambda TypeError
+    _mu = np.asarray(mu, dtype=np.float64)
+    _cov = np.asarray(cov, dtype=np.float64)
+    n_a = len(_mu)
     w0 = np.ones(n_a) / n_a
-    bd = [(bmin, bmax)] * n_a
-    c1 = {"type": "eq", "fun": lambda w: np.sum(w) - 1}
-    r_mv = minimize(lambda w: np.sqrt(np.dot(w, np.dot(cov, w))), w0, "SLSQP", bounds=bd, constraints=[c1])
-    r_min = float(np.dot(r_mv.x, mu))
-    r_max = float(np.max(mu))
+    bd = [(float(bmin), float(bmax))] * n_a
+
+    def _sum1(w): return float(np.sum(w)) - 1.0
+    def _vol(w):  return float(np.sqrt(float(w @ _cov @ w)))
+    def _ret(w):  return float(w @ _mu)
+
+    c1 = {"type": "eq", "fun": _sum1}
+    r_mv = minimize(_vol, w0, "SLSQP", bounds=bd, constraints=[c1])
+    r_min = _ret(r_mv.x)
+    r_max = float(np.max(_mu))
+
     fe_r, fe_v, fe_s = [], [], []
     for r_t in np.linspace(r_min, r_max, n_pts):
-        c2 = {"type": "eq", "fun": lambda w, r=r_t: np.dot(w, mu) - r}
-        res = minimize(lambda w: np.sqrt(np.dot(w, np.dot(cov, w))), w0, "SLSQP",
-                       bounds=bd, constraints=[c1, c2], options={"maxiter": 500})
+        _r = float(r_t)
+        def _c_ret(w, r=_r): return _ret(w) - r   # default-arg capture avoids late-binding
+        res = minimize(_vol, w0, "SLSQP", bounds=bd,
+                       constraints=[c1, {"type": "eq", "fun": _c_ret}],
+                       options={"maxiter": 500})
         if res.success or res.fun < 5.0:
-            r, v, s = port_stats(res.x, mu, cov, rf)
+            r, v, s = port_stats(res.x, _mu, _cov, rf)
             fe_r.append(r); fe_v.append(v); fe_s.append(s)
     return fe_r, fe_v, fe_s
 
@@ -358,22 +395,26 @@ if ejecutar:
         mu = ret_act.mean().values * periodos
         cov = ret_act.cov().values * periodos
 
-        # Benchmark statistics
+        # FIX 5: guard empty intersection, var_bm≈0, dtype, and 1-D edge case
         betas = capm_rets = alfas = treynors_ind = np.full(n_activos, np.nan)
         mu_bm = np.nan
         if precios_bm is not None:
             ret_bm_df, _ = retornos_calc(precios_bm, frecuencia)
             idx_com = ret_act.index.intersection(ret_bm_df.index)
-            rb = ret_bm_df.loc[idx_com, bm_ticker].values
-            ra = ret_act.loc[idx_com].values
-            mu_bm = float(np.mean(rb) * periodos)
-            var_bm = float(np.var(rb, ddof=1) * periodos)
-            betas = np.array([
-                (np.cov(ra[:, i], rb, ddof=1)[0, 1] * periodos) / var_bm
-                for i in range(n_activos)
-            ])
-            capm_rets = tasa_rf + betas * (mu_bm - tasa_rf)
-            alfas = mu - capm_rets
+            if len(idx_com) > 10:
+                rb = ret_bm_df.loc[idx_com, bm_ticker].values.astype(np.float64)
+                ra = ret_act.loc[idx_com].values.astype(np.float64)
+                if ra.ndim == 1:                   # single-asset edge case
+                    ra = ra.reshape(-1, 1)
+                mu_bm = float(np.mean(rb) * periodos)
+                var_bm = float(np.var(rb, ddof=1) * periodos)
+                if var_bm > 1e-12:
+                    betas = np.array([
+                        (np.cov(ra[:, i], rb, ddof=1)[0, 1] * periodos) / var_bm
+                        for i in range(n_activos)
+                    ])
+                    capm_rets = tasa_rf + betas * (mu_bm - tasa_rf)
+                    alfas = mu - capm_rets
 
         vols_ind = np.sqrt(np.diag(cov))
         sharpes_ind = np.where(vols_ind > 0, (mu - tasa_rf) / vols_ind, 0)
